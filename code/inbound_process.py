@@ -320,13 +320,7 @@ def build_inbound_data(date_parm, run_date, standard):
 
     # 用货件号 + 物流跟踪号关联真实物流追踪信息。
     tracking = read_tracking(date_parm)
-    # inbound = inbound_total.merge(
-    #     tracking,
-    #     how="left",
-    #     left_on=["货件号_key", "物流跟踪号_key"],
-    #     right_on=["FBA ID_key", "物流运单号_key"],
-    #     indicator=True,
-    # )
+    
     inbound = inbound_total.merge(
         tracking,
         how="left",
