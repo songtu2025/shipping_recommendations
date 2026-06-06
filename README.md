@@ -1,4 +1,4 @@
-# Shipping Recommendations NEW
+# Shipping Recommendations
 
 基于 Excel 数据的 FBA 发货建议项目。项目会综合销售预估、销占比、库存、在途货件、未出库预占和查验货件信息，计算各 MSKU 的断货风险，并输出建议发货列表。
 
