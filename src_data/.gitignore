@@ -1,0 +1,50 @@
+# ==========================================
+# shipping_recommendations
+# ==========================================
+
+# ---------- Excel / 数据文件 ----------
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
+# Excel 自动生成的临时文件
+~$*.xlsx
+~$*.xls
+~$*.xlsm
+
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Python 虚拟环境
+.venv/
+venv/
+env/
+
+
+# ---------- Jupyter Notebook ----------
+.ipynb_checkpoints/
+
+
+# ---------- 环境变量 / 密钥 ----------
+.env
+.env.*
+*.pem
+*.key
+
+
+# ---------- IDE ----------
+.vscode/
+.idea/
+
+
+# ---------- Windows ----------
+Thumbs.db
+Desktop.ini
+
+
+# ---------- macOS ----------
+.DS_Store
