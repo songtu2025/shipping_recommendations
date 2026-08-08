@@ -9,7 +9,122 @@ import warnings
 
 warnings.filterwarnings('ignore')
 pd.set_option('display.max_columns', None)
-      
+
+# ---------------------------构建未来最近n天的日均销量列表，例如构建未来30天的销量列表，该日均及天数由运营直接提供-------------------
+# 动态扩展场景，写一个自动识别 日均N/天数N 的通用版本，不需要手工写死 日均1、日均2
+def get_avg_days_pairs(columns):
+    pairs = []
+
+    for col in columns:
+        match = re.fullmatch(r"日均(\d+)", str(col))
+        if not match:
+            continue
+
+        n = match.group(1)
+        avg_col = f"日均{n}"
+        days_col = f"天数{n}"
+
+        if days_col in columns:
+            pairs.append((int(n), avg_col, days_col))
+
+    pairs.sort(key=lambda x: x[0])
+
+    return [(avg_col, days_col) for _, avg_col, days_col in pairs]
+
+
+def parse_days(days_value):
+    if pd.isna(days_value):
+        return 0
+
+    text = str(days_value).strip()
+    text = text.replace("～", "~").replace("-", "~")
+
+    if "~" in text:
+        start, end = text.split("~", 1)
+        start = int(float(start.strip()))
+        end = int(float(end.strip()))
+        return end - start
+
+    return int(float(text))
+
+def build_daily_list(row, avg_days_pairs):
+    daily_list = []
+
+    for avg_col, days_col in avg_days_pairs:
+        avg_value = row[avg_col]
+        days_value = row[days_col]
+
+        if pd.isna(avg_value) or pd.isna(days_value):
+            continue
+
+        days = parse_days(days_value)
+
+        if days <= 0:
+            continue
+
+        daily_list.extend([avg_value] * days)
+
+    return daily_list
+
+
+def build_daily_sales_list_prefix(df):
+    df = df.copy()
+    df.columns = df.columns.astype(str).str.strip()
+
+    avg_days_pairs = get_avg_days_pairs(df.columns)
+
+    result = (
+        df.groupby(["站点", "Listing"], as_index=False)
+          .first()
+    )
+
+    drop_cols = ["月份", "Listing_月度预估销量"]
+    result = result.drop(columns=[col for col in drop_cols if col in result.columns])
+
+    result["日均列表"] = result.apply(
+        lambda row: build_daily_list(row, avg_days_pairs),
+        axis=1
+    )
+
+    result = result[["站点", "Listing", "日均列表"]]
+
+    return result
+
+def scale_msku_daily_list(row):
+    """
+    将 Listing 维度日均列表按 款式销占比 和 SKU销占比 拆分到 MSKU 维度。
+    """
+    daily_list = row["日均列表"]
+    style_share = row["款式销占比"]
+    sku_share = row["SKU销占比"]
+
+    # 如果listing维度的日均列表为空，则返回空列表
+    if not isinstance(daily_list, list):
+        return []
+
+    if pd.isna(style_share) or pd.isna(sku_share):
+        return []
+
+    factor = style_share * sku_share
+
+    return [value * factor for value in daily_list]
+
+def msku_avg_days_list(sales_df, listing_daily_ls):
+    """
+    合并 Listing 日均列表，并生成 MSKU 日均列表。
+    """
+    msku_avg_days_df = sales_df.merge(
+        listing_daily_ls[["站点", "Listing", "日均列表"]],
+        how="left",
+        on=["站点", "Listing"]
+    )
+
+    msku_avg_days_df["MSKU日均列表"] = msku_avg_days_df.apply(scale_msku_daily_list, axis=1)
+
+    # 删除Listing的日均列表
+    msku_avg_days_df = msku_avg_days_df.drop(columns=["日均列表"])
+
+    return msku_avg_days_df
 
 # 计算库存情况的函数
 def calculate_inventory(start_date, initial_inventory, daily_sales, restock_dates, restock_quantities):
@@ -94,69 +209,6 @@ def calculate_available_sales(initial_inventory, daily_sales):
             break
     return available_sales
 
-
-# def process_datas(predict_df, sales_df, inventory_df, shipment_df):
-    """
-      处理数据，生成合并后的数据框、发货数据透视表和SKU库存状况表
-
-    Parameters:
-    predict_df (DataFrame): 预测数据
-    sales_df (DataFrame): 销售数据
-    inventory_df (DataFrame): 库存数据
-    shipment_df (DataFrame): 发货数据
-
-    Returns:
-    merge_df (DataFrame): 合并后的数据框
-    shipment_ret (DataFrame): 发货数据透视表
-    sku_inv (DataFrame): SKU库存状况表
-    """
-    # 从仓库中提取 店铺-站点 信息
-    shipment_df['店铺-站点'] = shipment_df['仓库'].str.split('_', expand=True)[0]
-
-    # SKU维度的库存状况
-    sku_inv = shipment_df.pivot_table(index=['店铺-站点', 'SKU', 'MSKU'], columns=['状态'], values='发货量',
-                                      aggfunc=sum, fill_value=0).reset_index()
-
-    # 透视并汇总发货数据
-    shipment_ret = shipment_df.pivot_table(index=['店铺-站点', 'SKU', 'MSKU', '预计到仓日期'], values='发货量',
-                                           aggfunc=sum, fill_value=0).reset_index()
-    shipment_ret['预计到仓日期'] = pd.to_datetime(shipment_ret['预计到仓日期'])
-    shipment_ret['ID'] = shipment_ret[['MSKU', 'SKU', '店铺-站点']].sum(axis=1)
-
-
-    # 计算日期差异
-    predict_df['当月总天数'] = predict_df['月份'].apply(lambda x: calendar.monthrange(x.year, x.month)[1])
-
-    #  是一个新列，存储了每一行的 月份 对应的月末日期与当前日期之间的天数差（加 1 后的结果）
-    predict_df['当前可用天数'] = (predict_df['月份'] + pd.offsets.MonthEnd(0) - datetime.datetime.now()).dt.days + 1
-    predict_df = predict_df.query('当前可用天数 > 0')
-    
-    # 对 '当前可用天数' 列进行 clip 操作。np.clip 是 NumPy 提供的一个函数，用于将数组中的值限制在指定范围内。
-    # 目的是确保 当前可用天数 的值在合理的范围内：
-        # 最小值为 0：因为天数不能为负数。
-        # 最大值为 当月总天数：因为 当前可用天数 不可能超过当月的总天数。
-    predict_df['当前可用天数'] = np.clip(predict_df['当前可用天数'], a_min=0, a_max=predict_df['当月总天数'])
-
-    # 合并数据框
-    merge_df = pd.merge(left=sales_df,
-                        right=predict_df[['站点', 'Listing', '当月总天数', '当前可用天数', 'Listing_月度预估销量']],
-                        on=['站点', 'Listing'], how='left')
-
-    # 计算MSKU每日均值
-    merge_df['MSKU日均'] = (merge_df['Listing_月度预估销量'] / merge_df['当月总天数']) * merge_df['款式销占比'] * \
-                           merge_df['SKU销占比']
-
-    # 与库存数据合并
-    merge_df = pd.merge(left=merge_df, right=inventory_df, left_on=['店铺-站点', '积加SKU', 'MSKU'],
-                        right_on=['仓库', 'SKU', 'MSKU'], how='left')
-
-    # 删除不必要的列
-    merge_df.drop(columns=['仓库', 'SKU', '当月总天数'], inplace=True)
-
-    # 计算ID列
-    merge_df['ID'] = merge_df[['MSKU', '积加SKU', '店铺-站点']].sum(axis=1)
-
-    return merge_df, shipment_ret, sku_inv
 def process_datas(predict_df, sales_df, inventory_df, shipment_df):
     """
       处理数据，生成合并后的数据框、发货数据透视表和SKU库存状况表
@@ -216,71 +268,15 @@ def process_datas(predict_df, sales_df, inventory_df, shipment_df):
 
     return merge_df, shipment_ret, sku_inv
 
-# def get_daily_sales_parm(target_days, temp_df):
+
+def replace_prefix(a, b):
     """
-    获取每日销售量参数的函数。
-
-    Parameters:
-    - target_days: int，目标天数
-    - temp_df: DataFrame，包含销售数据的DataFrame
-
-    Returns:
-    list，包含每日销售量的列表
+    用列表a替换列表b的前len(a)个元素。
+    要求：len(a) <= len(b)
     """
-
-    # # 确保没有 NaN 值 todo
-    # temp_df['MSKU日均'] = temp_df['MSKU日均'].fillna(0)
-    # temp_df['当前可用天数'] = temp_df['当前可用天数'].fillna(0)
-
-    # 提取 MSKU日均 和 当前可用天数 两列，并将它们重置索引（reset_index(drop=True)），确保它们是独立的序列
-    sales_avg = temp_df.MSKU日均.reset_index(drop=True)
-    curr_days = temp_df.当前可用天数.reset_index(drop=True)
-    '''
-    # print("get_daily_sales_parm函数中：\tsales_avg=", sales_avg, "\tcurr_days=", curr_days)
-    # 以上代码输出的值如下：
-    get_daily_sales_parm函数中：    
-    sales_avg= 
-    0    15.347564
-    1    17.378456
-    2    15.235300
-    3    10.993792
-    4     9.045033
-    5     8.236815
-    6     6.512905
-    7     8.888224
-    Name: MSKU日均, dtype: float64  
-    curr_days= 
-    0    25
-    1    30
-    2    31
-    3    31
-    4    30
-    5    31
-    6    30
-    7    31
-    Name: 当前可用天数, dtype: int64
-    '''
-
-    # 使用 np.cumsum 计算 当前可用天数 的累计和。cumulative_sum 是一个数组，表示从第一天开始的累计天数。cumsum函数用于计算数组的累积和（cumulative sum）。它会沿着指定的轴对数组中的元素进行逐项累加，生成一个新的数组，其中每个元素是原始数组中从开始到当前位置的所有元素之和。
-    cumulative_sum = np.cumsum(curr_days) 
-
-    # 找到累计和超过目标天数的索引；
-    # 使用 np.argmax 找到第一个累计和超过 target_days目标天数 的索引
-    index = np.argmax(cumulative_sum > target_days)
-    if index == 0:
-        index = len(cumulative_sum) - 1
-    # print(f'index:{index}')
-    # print('------------------------------')
-    # print(f'cumulative_sum：{cumulative_sum}')
-
-    # 更新 curr_days 和 sales_avg
-    #     如果目标天数小于累计和的最后一个值，调整 curr_days当前可用天数 中的最后一个值，使其恰好达到 target_days目标天数。
-    #     截取 curr_days-当前可用天数 和 sales_avg-MSKU日均，只保留到 index + 1 的部分
-    if index < len(curr_days) and target_days <= cumulative_sum.iloc[-1]:
-        curr_days.iloc[index] = target_days - (cumulative_sum[index] - curr_days.iloc[index])
-    curr_days = curr_days.iloc[:index + 1]
-    sales_avg = sales_avg.iloc[:index + 1]
-    return [item for avg, days in zip(sales_avg, curr_days) for item in [avg] * int(days)]
+    b = b.copy()      # 如果不想修改原列表
+    b[:len(a)] = a
+    return b
 
 def get_daily_sales_parm(target_days, temp_df):
     """
@@ -297,6 +293,9 @@ def get_daily_sales_parm(target_days, temp_df):
     # # 确保没有 NaN 值 todo
     # temp_df['MSKU日均'] = temp_df['MSKU日均'].fillna(0)
     # temp_df['当前可用天数'] = temp_df['当前可用天数'].fillna(0)
+
+    # 获取msku日均列表
+    msku_avg_days_pro = temp_df['MSKU日均列表'].iloc[0]
 
     sales_avg = temp_df.MSKU日均.reset_index(drop=True)
     curr_days = temp_df.当前可用天数.reset_index(drop=True)
@@ -318,9 +317,14 @@ def get_daily_sales_parm(target_days, temp_df):
         curr_days.iloc[index] = target_days - (cumulative_sum[index] - curr_days.iloc[index])
     curr_days = curr_days.iloc[:index + 1]
     sales_avg = sales_avg.iloc[:index + 1]
-    # print('curr_days:\n', curr_days)
+
     # 使用列表推导式生成每日销售量的列表。对于每一对 avg（日均销售量）和 days（天数），重复 avg 值 days 次。
-    return [item for avg, days in zip(sales_avg, curr_days) for item in [avg] * int(days)]
+    avg_sales_original_ls = [item for avg, days in zip(sales_avg, curr_days) for item in [avg] * int(days)]
+    
+    # 将【计算出的MSKU日均列表-avg_sales_original_ls】替换为【自定义的MSKU日均列表-msku_avg_days_pro】，只替换前len(msku_avg_days_pro) 个值
+    avg_sales_ls_new = replace_prefix(msku_avg_days_pro, avg_sales_original_ls)
+
+    return avg_sales_ls_new
 
 def get_total_sales(target_days, temp_df):
     """

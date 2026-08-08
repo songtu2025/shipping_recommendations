@@ -22,8 +22,8 @@
 
 from pathlib import Path
 import sys
-
 import pandas as pd
+
 
 
 # 默认处理日期；命令行传日期时会覆盖它。
@@ -306,8 +306,11 @@ def build_inbound_data(date_parm, run_date, standard):
 
     # 读取地区映射表，直接当作参数表的一个匹配字段。
     fba_area = pd.read_excel(path, sheet_name="地区映射表", usecols=["FBA仓库", "地区"])
-    
+
+    # inspection_excluded不纳入库存计算的货件集合
     inspection_excluded, inspection_eta = read_inspection_rules()
+    print("不纳入库存计算的FBAid：", inspection_excluded)
+    print("纳入库存计算的FBAid及到仓日期：", inspection_eta)
 
     # 主表负责货件维度的状态、物流方式和物流节点。
     inbound_total = pd.read_excel(
@@ -369,8 +372,8 @@ def build_inbound_data(date_parm, run_date, standard):
 
     # 查验表：不纳入库存的货件直接剔除；纳入库存的货件保留并覆盖到仓日期。
     inbound_total["货件号_key"] = clean_series(inbound_total["货件号"])
-    inbound_total = inbound_total[~inbound_total["货件号_key"].isin(inspection_excluded)].copy()
-    inbound_total["查验预计到仓日期"] = inbound_total["货件号_key"].map(inspection_eta)
+    # inbound_total = inbound_total[~inbound_total["货件号_key"].isin(inspection_excluded)].copy()
+    # inbound_total["查验预计到仓日期"] = inbound_total["货件号_key"].map(inspection_eta)
 
     # 清洗后续匹配与计算需要的字段。
     inbound_total["物流方式"] = clean_series(inbound_total["物流方式"])
@@ -391,6 +394,8 @@ def build_inbound_data(date_parm, run_date, standard):
     )
     inbound["有物流追踪"] = inbound["_merge"].eq("both") # 只要能匹配到追踪表记录就算有物流追踪，不要求所有节点都存在。
 
+    print(f"发货单总表与物流追踪表合并后-列名: {inbound.columns.tolist()}\n")
+
     # 物流追踪节点中带“预计”的时间不算真实时间。
     for col in ["入库时间", "离港时间", "到港时间", "签收时间"]:
         inbound[f"{col}_实际"] = parse_date_series(inbound[col], actual_only=True)
@@ -404,7 +409,9 @@ def build_inbound_data(date_parm, run_date, standard):
     inbound["参数国家"] = inbound["目的国家"] 
     inbound["参数物流商"] = inbound["追踪物流商"].where(inbound["有物流追踪"], inbound["物流商"]).map(normalize_vendor)  # 有物流追踪时，用追踪表里的物流商作为 参数物流商；没有物流追踪时，退回用发货单的物流商作为 参数物流商。
     inbound["参数物流渠道"] = clean_series(inbound["追踪物流渠道"].where(inbound["有物流追踪"], inbound["物流方式"]))
-    inbound["参数地区"] = inbound["地区"]
+    inbound["参数地区"] = inbound["地区"]   # 直接用发货单的地区字段作为 参数地区，因为追踪表的地区信息存在不完整。
+    # 将“地区”列删除
+    inbound = inbound.drop(columns=["地区"])
 
     inbound, missing = add_eta_by_standard(inbound, standard, "在途货件")
 
@@ -415,7 +422,6 @@ def build_inbound_data(date_parm, run_date, standard):
     merge_df = inbound_ret.merge(inbound_detail, left_on=["发货单号","货件号"], right_on=["发货单号","ShipmentId"], how="left")
     # 删除“货件号”列
     merge_df = merge_df.drop(columns=["货件号"])
-    # merge_df.to_excel(INBOUND_DIR / f"{date_parm} 发货单与发货单明细合并结果.xlsx", index=False)
     print(f"发货单总表与发货单明细表合并后数据列名: {merge_df.columns.tolist()}")
 
     # 入库中货件单独输出接收中报表；其余进入正常在途库存。
@@ -423,7 +429,48 @@ def build_inbound_data(date_parm, run_date, standard):
 
     fba_receive_detail = merge_df[merge_df["状态"] == "入库中"].copy()
     fba_receive_detail = fba_receive_detail.drop(columns=["离港时间", "到港时间", "签收时间"])
+
     
+    # 接收中汇总沿用旧输出口径：仓库去掉 _FBA 后作为店铺站点。
+    fba_receive_detail = fba_receive_detail.rename(columns={"仓库": "店铺-站点"})
+    fba_receive_detail["店铺-站点"] = fba_receive_detail["店铺-站点"].str.replace("_FBA", "", regex=False)
+    fba_receive_detail["已收量"] = fba_receive_detail["发货量"] - fba_receive_detail["差异量"]
+
+    # 筛选出货件接收7天内且差异量>0的行，将该差异量计入为FBA可售库存
+
+    # # 条件
+    # condition = (fba_receive_detail['接收天数'] <= 7) & (fba_receive_detail['差异量'] > 0)
+    # # 新增列
+    # fba_receive_detail['是否计入可售'] = np.where(condition, '是', '否')
+
+    fba_receive_detail['是否已计入可售'] = '否'
+    fba_receive_detail.loc[
+        (fba_receive_detail['接收天数'] <= 7) & (fba_receive_detail['差异量'] > 0),
+        '是否已计入可售'
+    ] = '是'
+
+    
+    # 保留不纳入库存计算的查验数据
+    inspection_excluded_df = fba_inbound[fba_inbound["ShipmentId"].isin(inspection_excluded)]
+    inspection_excluded_df = inspection_excluded_df[['仓库', 'SKU', 'MSKU', '发货量', '预计出运日期', '状态', '物流方式', 'ShipmentId']]
+
+    inspection_excluded_total = (
+            inspection_excluded_df.pivot_table(
+                index=["仓库", "SKU", "MSKU"],
+                values=["发货量"],
+                aggfunc="sum",
+            )
+            .reset_index()
+        )
+
+    # 查验表：不纳入库存的货件直接剔除；纳入库存的货件保留并覆盖到仓日期。
+    fba_inbound = fba_inbound[~fba_inbound["ShipmentId"].isin(inspection_excluded)].copy()
+    print("fba_inbound 数量：", len(fba_inbound))
+
+    fba_inbound["查验预计到仓日期"] = fba_inbound["ShipmentId"].map(inspection_eta)
+    # 查验表指定日期优先级最高。
+    fba_inbound["预计到仓日期"] = fba_inbound["查验预计到仓日期"].combine_first(fba_inbound["预计到仓日期"]) if "查验预计到仓日期" in fba_inbound.columns else fba_inbound["预计到仓日期"]
+
     # 如果预计到仓日期早于运行日期，说明实际还未到仓，则预计到仓日期加7天，若+7天还是早于运行日期，则先不计入在途。
     future_mask = fba_inbound["预计到仓日期"] < run_date
     # 将这部分数据输出到异常表，方便后续检查数据质量。
@@ -437,8 +484,17 @@ def build_inbound_data(date_parm, run_date, standard):
             .map({True: "是", False: "否"})
         )
         future_records_detail = future_records_detail[["发货单号", "ShipmentId", "物流方式", "预计出运日期", "预计到仓日期", "状态", "仓库", "SKU","MSKU", "发货量", "差异量", "预计到仓日期+7天", "是否计入在途", "离港时间", "到港时间", "签收时间"]]
+        # future_records_detail.to_excel(INBOUND_DIR / f"{date_parm} 在途中货件预计到仓日期早于运行日期的记录.xlsx", index=False)
+        future_records_total = (
+            future_records_detail.pivot_table(
+                index=["仓库", "SKU", "MSKU","是否计入在途"],
+                values=["发货量", "差异量"],
+                aggfunc="sum",
+            )
+            .reset_index()
+        )
     else:
-        print(f"{date_parm} 在途中货件预计到仓日期早于运行日期的记录为空，无需输出异常表")
+        print(f"{date_parm} 在途中货件预计到仓日期早于运行日期的记录为空，无需输出异常表。\n")
 
     fba_inbound.loc[future_mask, "预计到仓日期"] = fba_inbound.loc[future_mask, "预计到仓日期"] + pd.Timedelta(days=7)
     fba_inbound = fba_inbound.drop(columns=["离港时间", "到港时间", "签收时间"])
@@ -446,25 +502,21 @@ def build_inbound_data(date_parm, run_date, standard):
     if fba_receive_detail.empty:
         fba_receive_total = pd.DataFrame(columns=["店铺-站点", "SKU", "MSKU", "发货量", "差异量", "已收量"])
     else:
-        # 接收中汇总沿用旧输出口径：仓库去掉 _FBA 后作为店铺站点。
-        fba_receive_detail = fba_receive_detail.rename(columns={"仓库": "店铺-站点"})
-        fba_receive_detail["店铺-站点"] = fba_receive_detail["店铺-站点"].str.replace("_FBA", "", regex=False)
-        fba_receive_detail["已收量"] = fba_receive_detail["发货量"] - fba_receive_detail["差异量"]
         fba_receive_total = (
             fba_receive_detail.pivot_table(
-                index=["店铺-站点", "SKU", "MSKU"],
+                index=["店铺-站点", "SKU", "MSKU", "是否已计入可售"],
                 values=["发货量", "差异量", "已收量"],
                 aggfunc="sum",
             )
             .reset_index()
         )
 
-    return fba_inbound, fba_receive_total, fba_receive_detail, missing, future_records_detail
+    return fba_inbound, fba_receive_total, fba_receive_detail, missing, future_records_detail,future_records_total, inspection_excluded_df, inspection_excluded_total
 
 
 def build_yuzhan_data(date_parm, run_date, standard):
     """构建未出库调拨单来源的预占在途数据。"""
-    yuzhan_path = YUZHAN_DIR / f"未出库调拨单导出{date_parm}.xlsx"
+    yuzhan_path = f"E:/sontu/shipping_recommendations/src_data/预占单/未出库调拨单导出{date_parm}.xlsx"
 
     # 明细表提供 SKU/MSKU 和数量；单据表提供仓库、状态、物流方式。
     yuzhan_detail = pd.read_excel(
@@ -558,7 +610,7 @@ def write_missing_and_raise(missing_frames):
     raise ValueError(f"{missing_path} 文件已生成，请补齐标准时效参数表后重跑")
 
 
-def write_output(date_parm, fba_inbound, fba_receive_total, fba_receive_detail, yuzhan_output, yuzhan_false, future_records_detail):
+def write_output(date_parm, fba_inbound, fba_receive_total, fba_receive_detail, yuzhan_output, yuzhan_false, future_records_detail, future_records_total, inspection_excluded_df, inspection_excluded_total):
     """写出最终在途货件 Excel，保持旧文件结构不变。"""
     standard_titles = ["仓库", "SKU", "MSKU", "发货量", "预计到仓日期", "预计出运日期", "状态", "物流方式", "ShipmentId", "发货单号"]
 
@@ -575,9 +627,12 @@ def write_output(date_parm, fba_inbound, fba_receive_total, fba_receive_detail, 
         fba_receive_total.to_excel(writer, sheet_name="接收中-汇总", index=False)
         fba_receive_detail.to_excel(writer, sheet_name="接收中-货件详情", index=False)
         future_records_detail.to_excel(writer, sheet_name=f"预计到仓日期早于当天日期的记录", index=False)
+        future_records_total.to_excel(writer, sheet_name=f"预计到仓日期早于当天日期的记录-汇总", index=False)
+        inspection_excluded_df.to_excel(writer, sheet_name='不计入在途的查验货件详情', index = False)
+        inspection_excluded_total.to_excel(writer, sheet_name='不计入在途的查验货件MSKU汇总', index = False)
         yuzhan_false.to_excel(writer, sheet_name=f"预占超过{EXCEPTION_DAYS}天", index=False)
-        
     print(f"已生成: {output_path}")
+
 
 def main(date_parm=DEFAULT_DATE):
     """脚本主入口。"""
@@ -585,12 +640,12 @@ def main(date_parm=DEFAULT_DATE):
     standard = read_standard_params()
 
     # 分别构建发货单在途数据和未出库调拨单预占数据。
-    fba_inbound, fba_receive_total, fba_receive_detail, inbound_missing, future_records_detail = build_inbound_data(date_parm, run_date, standard)
+    fba_inbound, fba_receive_total, fba_receive_detail, inbound_missing, future_records_detail, future_records_total, inspection_excluded_df, inspection_excluded_total = build_inbound_data(date_parm, run_date, standard)
     yuzhan_output, yuzhan_false, yuzhan_missing = build_yuzhan_data(date_parm, run_date, standard)
 
     # 先处理缺参；只有参数完整时才生成最终结果。
     write_missing_and_raise([inbound_missing, yuzhan_missing])
-    write_output(date_parm, fba_inbound, fba_receive_total, fba_receive_detail, yuzhan_output, yuzhan_false, future_records_detail)
+    write_output(date_parm, fba_inbound, fba_receive_total, fba_receive_detail, yuzhan_output, yuzhan_false, future_records_detail, future_records_total, inspection_excluded_df, inspection_excluded_total)
 
 if __name__ == "__main__":
     # 支持命令行传入处理日期，例如：python code/inbound_process_dynamic.py 20260518

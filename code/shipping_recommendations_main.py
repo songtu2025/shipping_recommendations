@@ -29,15 +29,35 @@ def main(parm_date, listing_template_path, sales_program_path, inventory_path, s
     sales_df = pd.read_excel(sales_program_path,
                              usecols=['站点', '店铺-站点', '品牌', 'Listing', 'MSKU', '积加SKU', '款式销占比', 'SKU销占比',
                                       '规模定位','总发货天数','快递','空运','海运'])
+
+    # 构建日均销量列表
+    listing_daily_sales = build_daily_sales_list_prefix(predict_df)
+    # 生成MSKU的日均列表
+    msku_daily_sales = msku_avg_days_list(sales_df, listing_daily_sales)
+    
     inventory_df = pd.read_excel(inventory_path,
                                  usecols=['仓库', 'SKU', 'MSKU', '预占总数', '快递_预占', '空运_预占', '海运_预占', 'FBA自提物流_预占', 'FBA可用库存', 'FBA在途', '7天日均', '15天日均', '30天日均', '已下单数量', '本地锁仓数','本地-在途', '已生产未发货'],
                                  sheet_name='库存汇总')
-    # inventory_df = pd.read_excel(inventory_path,
-    #                              usecols=['仓库', 'SKU', 'MSKU', '预占总数', 'FBA自提物流_预占', '空运_预占', '海运_预占', 'FBA可用库存', 'FBA在途', '7天日均', '15天日均', '30天日均', '已下单数量', '本地锁仓数','本地-在途', '已生产未发货'],
-    #                              sheet_name='库存汇总')
+
     local_df = pd.read_excel(inventory_path, usecols=['SKU', 'CA', 'DE', 'JP', 'UK', 'US', 'TK本地仓', '共享'], sheet_name='本地仓库存透视')
     sea_df = pd.read_excel(inventory_path, sheet_name='海外仓库存')
     shipment_df = pd.read_excel(shipment_path, sheet_name='在途货件-正常', parse_dates=['预计到仓日期'])   # 这里的在途货件有三种状态：已出运、未出库（预占数据：未从本地出库）、提货中
+    
+    # 筛选计入可售的差异量, 计算 FBA可用库存 = 差异量 + FBA可用库存
+    shipment_receive_total = pd.read_excel(shipment_path, sheet_name='接收中-汇总')
+    shipment_receive_total_available = shipment_receive_total[shipment_receive_total['是否已计入可售'] == '是'].copy()
+    # print(shipment_receive_total_available.columns)
+    shipment_receive_total_available = shipment_receive_total_available[['店铺-站点', 'SKU', 'MSKU', '差异量']]
+
+    inventory_df = pd.merge(left=inventory_df, right=shipment_receive_total_available, left_on=['仓库', 'SKU','MSKU'], right_on=['店铺-站点','SKU','MSKU'], how='left')
+    # 将差异量为空的填充为0
+    inventory_df['差异量'] = inventory_df['差异量'].fillna(0)
+    inventory_df['FBA可用库存'] = inventory_df['FBA可用库存'] + inventory_df['差异量']
+    inventory_df.rename(columns={'差异量':'差异量-已计入可用库存'}, inplace=True)
+    inventory_df.drop(columns=['店铺-站点'], inplace=True)  
+    # inventory_df.to_excel(r'E:\sontu\shipping_recommendations\src_data\处理后的库存\库存-差异量1.xlsx', index = False)
+    # print('库存-差异量 已保存')
+
 
     # 2、构建建议发货列表初始参数
     send_goods = pd.read_excel(sales_program_path,
@@ -47,10 +67,10 @@ def main(parm_date, listing_template_path, sales_program_path, inventory_path, s
     # 将 send_goods 数据框中 MSKU、积加SKU 和 店铺-站点 这三列的值按行相加，并将结果存储到新列 ID 中; sum(axis=1) 默认是对数值型数据进行求和操作
     send_goods['ID'] = send_goods[['MSKU', '积加SKU', '店铺-站点']].sum(axis=1)
 
-    merge_df, shipment_ret, sku_inv = process_datas(predict_df, sales_df, inventory_df, shipment_df)
+    merge_df, shipment_ret, sku_inv = process_datas(predict_df, msku_daily_sales, inventory_df, shipment_df)
+
     # merge_df.to_excel(f'merge_df-{days}.xlsx', index = False)
     # print(merge_df.columns)
-
 
     stockout_dict = {'ID': [], 'FBA在库可售天数': [], 'FBA总可售天数': [], '总库存可售天数': [], '首次断货前可售天数': [], 'FBA库存': [], '断货风险总天数': [],
                      '断货总损失销量': [],
@@ -115,10 +135,13 @@ def main(parm_date, listing_template_path, sales_program_path, inventory_path, s
         # print(f'item_id：{item_id}', f'target_days：{target_days}', f'temp_df：{temp_df}')
 
         goal_sales = get_daily_sales_parm(target_days, temp_df)
-        
+        # print(goal_sales)
+        # print(len(goal_sales))
+
 
         # 用于计算可售天数。TODO:目标可售天数都是165天，为什么还要写这么多同样的函数赋值给不同的变量？ --- 不管有什么库存目标可售天数都发165天
         daily_sales_parm = get_daily_sales_parm(165, temp_df)
+        
         daily_sales_parm_135 = get_daily_sales_parm(135, temp_df)
         daily_sales_parm_165 = get_daily_sales_parm(165, temp_df)
 
@@ -245,7 +268,7 @@ def main(parm_date, listing_template_path, sales_program_path, inventory_path, s
     ret_df.rename(columns={'未出库': 'FBA预占'}, inplace=True)    # 未出库：预占数据（未从本地出库），在途货件里，状态为“未出库”
 
     # 匹配近期销量
-    ret_df = pd.merge(left=ret_df, right=inventory_df[['仓库', 'MSKU', '7天日均', '15天日均', '30天日均', '已下单数量', '本地锁仓数','本地-在途', '已生产未发货', '预占总数', '快递_预占', '空运_预占', '海运_预占', 'FBA自提物流_预占']], how='left',
+    ret_df = pd.merge(left=ret_df, right=inventory_df[['仓库', 'MSKU', '7天日均', '15天日均', '30天日均', '已下单数量', '本地锁仓数','本地-在途', '已生产未发货', '预占总数', '快递_预占', '空运_预占', '海运_预占', 'FBA自提物流_预占','差异量-已计入可用库存']], how='left',
                       left_on=['店铺-站点', 'MSKU'], right_on=['仓库', 'MSKU']).drop(columns=['仓库'])
     # ret_df = pd.merge(left=ret_df, right=inventory_df[['仓库', 'MSKU', '7天日均', '15天日均', '30天日均', '已下单数量', '本地锁仓数','本地-在途', '已生产未发货', '预占总数', 'FBA自提物流_预占', '空运_预占', '海运_预占']], how='left',
                     #   left_on=['店铺-站点', 'MSKU'], right_on=['仓库', 'MSKU']).drop(columns=['仓库'])
@@ -359,7 +382,7 @@ def main(parm_date, listing_template_path, sales_program_path, inventory_path, s
      '补货', '借调',
      'FBA在库可售天数', 'FBA总可售天数', '本地库存可售天数', '总库存可售天数', '预估在库日均',
      '断货风险总天数', '断货总损失销量','首次断货前可售天数', 
-     'FBA库存', '已出运', 'FBA预占',  'FBA在途',
+     'FBA库存', '已出运', 'FBA预占',  'FBA在途','差异量-已计入可用库存',
      'dhl_pre', 'air_pre', 'sea_pre',
      'dhl_pre实际可发货数', 'air_pre实际可发货数', 'sea_pre实际可发货数',
      'dhl_pre缺货数', 'air_pre缺货数', 'sea_pre缺货数',
